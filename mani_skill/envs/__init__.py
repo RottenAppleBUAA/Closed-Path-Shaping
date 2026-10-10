@@ -1,0 +1,1 @@
+from .tasks.trajectory_shape import TrajectoryShapePOMDPV2CoreRewardEnv

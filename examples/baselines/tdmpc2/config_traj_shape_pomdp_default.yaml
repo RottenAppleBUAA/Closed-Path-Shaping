@@ -2,6 +2,7 @@ defaults:
   - config
   - _self_
 
+# Task interface and model-size preset.
 env_id: TrajectoryShapePOMDPV2CoreReward-v1
 obs: state
 env_type: gpu
@@ -9,6 +10,7 @@ control_mode: default
 model_size: 5
 exp_name: traj-shape-pomdp-default
 seed: 123
+# Vector rollout, replay capacity, and learner update budget.
 num_envs: 256
 num_eval_envs: 4
 steps: 1_000_000
@@ -20,7 +22,9 @@ buffer_size: 1_000_000
 steps_per_update: 16
 pretrain_updates: 1280
 wandb: false
+# Episode horizon measured in macro steps.
 time_limit: 256
+# Compact partial observations with a four-frame history.
 traj_obs_mode: partial
 traj_obs_vector_mode: compact
 traj_curve_repr: fft
@@ -30,10 +34,12 @@ traj_poi_num_min: 4
 traj_poi_num_max: 8
 traj_poi_max_obs: 8
 traj_poi_sample_interval: 3
+# Noise is added in world coordinates before observation normalization.
 traj_obs_noise_std: 0.05
 traj_obs_dropout_prob: 0.05
 traj_center_mode: fixed
 traj_obs_source: trajectory
 traj_privileged_stats_in_obs: false
+# Core reward weights: scene-PoI distance and planned-coverage deficit.
 traj_reward_abs_weight: 0.45
 traj_reward_t_theta_weight: 0.30

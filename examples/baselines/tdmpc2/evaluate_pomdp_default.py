@@ -31,6 +31,7 @@ from evaluation.rollout import (
 
 
 def _write_csv(path, rows):
+    """Write metric rows with a stable field order shared by the whole table."""
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -38,6 +39,11 @@ def _write_csv(path, rows):
 
 
 def main():
+    """
+    Evaluate a frozen default planner with joint UAV execution.
+    Export per-step and per-episode metrics, then save the effective config
+    and checkpoint hash alongside the aggregate results.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--config", type=Path, help="Saved training config; auto-detected next to models/.")
@@ -56,6 +62,7 @@ def main():
         parser.error("At least one seed is required")
     if args.device == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA is unavailable; use --device cpu for a verification rollout")
+    # Recover the training architecture and task settings before applying evaluation overrides.
     config_path = args.config or checkpoint.parent.parent / "config.yaml"
     if args.config is not None and not config_path.is_file():
         parser.error(f"Training configuration not found: {config_path}")
@@ -69,6 +76,7 @@ def main():
         with open_dict(cfg):
             cfg = OmegaConf.merge(cfg, saved)
     cfg.env_type = "gpu" if args.device == "cuda" else "cpu"
+    # Run scene seeds serially so each episode owns its observer and heat state.
     cfg.num_envs = cfg.num_eval_envs = 1
     cfg.time_limit = args.steps
     cfg.wandb = False
@@ -83,6 +91,7 @@ def main():
     out = args.output_dir.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False)
     summaries = []
+    # Reset both task and planner randomness for each evaluation episode.
     for seed in seeds:
         set_seed(seed)
         env.reset(seed=seed)
@@ -96,6 +105,7 @@ def main():
         rows = []
         for step in range(args.steps):
             action = agent.act(obs, t0=step == 0, eval_mode=True)
+            # Joint order: deform path and move PoIs, execute UAVs, then collect coverage.
             reward = _joint_apply_action(task, action)
             curve = _curve_np(task)
             state, controls, track_error = _step_uav_tracking(tracking, task, state, curve)
@@ -113,10 +123,12 @@ def main():
             row.update(uav)
             row["t_uav_theta_gap"] = t_theta - uav["uav_T_theta"]
             rows.append(row)
+            # The next planner call receives only the newly refreshed partial observation.
             obs = _joint_refresh_observation(task, state, reset=False)
         _write_csv(out / f"steps_seed_{seed}.csv", rows)
         summary = dict(seed=seed, episode_steps=len(rows),
                        episode_return=sum(row["reward"] for row in rows))
+        # AUC follows the native convention: the arithmetic mean of rollout steps.
         for name in ["T_theta", "uav_T_theta", "mean_poi_dist", "uav_mean_poi_dist",
                      "min_poi_coverage_ratio", "uav_min_poi_coverage_ratio", "uav_track_error_mean"]:
             summary[name + "_auc"] = float(np.mean([row[name] for row in rows]))
@@ -124,6 +136,7 @@ def main():
         summary["t_uav_theta_auc_gap"] = summary["T_theta_auc"] - summary["uav_T_theta_auc"]
         for name in ["uav_unique_poi_swept", "uav_unique_poi_swept_ratio", "uav_control_energy_cumulative"]:
             summary[name + "_final"] = rows[-1][name]
+        # Effort per coverage uses a step-sum denominator, with a zero-coverage safeguard.
         integral = sum(row["uav_T_theta"] for row in rows)
         summary["uav_T_theta_integral"] = integral
         summary["uav_energy_per_t_theta_integral"] = rows[-1]["uav_control_energy_cumulative"] / max(integral, 1e-6)
@@ -131,9 +144,11 @@ def main():
         summaries.append(summary)
         print(json.dumps(summary))
     _write_csv(out / "episodes.csv", summaries)
+    # Report population standard deviation across the chosen scene seeds.
     aggregate = {key: {"mean": float(np.mean([row[key] for row in summaries])),
                        "std": float(np.std([row[key] for row in summaries]))}
                  for key in summaries[0] if key not in {"seed", "episode_steps"}}
+    # Record protocol and model provenance separately from the policy observation.
     manifest = dict(protocol="ManiSkill native joint UAV evaluation (standalone default extraction)",
                     method="default TD-MPC2", environment=cfg.env_id, seeds=seeds, steps=args.steps,
                     checkpoint=str(checkpoint), checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),

@@ -12,10 +12,16 @@ TRAJECTORY_SHAPE_TASKS = {
 }
 
 class TorchTrajectoryShapeVectorEnv:
-	"""SAPIEN-free vector adapter for the tensor-only trajectory-shape tasks."""
+	"""
+	Tensor vector adapter for batched closed-path shaping.
+	Uses the task dynamics directly and adds fixed-horizon episode statistics
+	without constructing a simulator or automatically resetting completed rows.
+	"""
 
 	def __init__(self, cfg, num_envs: int, is_eval: bool = False):
+		"""Create task buffers and batched Gymnasium spaces for the selected device."""
 		task_cls = TRAJECTORY_SHAPE_TASKS[cfg.env_id]
+		# The adapter supplies batch storage and episode bookkeeping itself.
 		self._task = task_cls.__new__(task_cls)
 		self.env_id = cfg.env_id
 		self.num_envs = int(num_envs)
@@ -37,6 +43,10 @@ class TorchTrajectoryShapeVectorEnv:
 		self.observation_space = batch_space(self.single_observation_space, n=self.num_envs)
 
 	def _init_task(self, task_cls, cfg):
+		"""
+		Configure the task directly from defaults and traj_* overrides.
+		Share the action spaces with the task while leaving episode limits here.
+		"""
 		task = self._task
 		task.num_envs = self.num_envs
 		task.device = self.device
@@ -45,6 +55,7 @@ class TorchTrajectoryShapeVectorEnv:
 		task._elapsed_steps = torch.zeros((self.num_envs,), dtype=torch.int32, device=self.device)
 		task._raw_kwargs = {}
 		task._traj_cfg = copy.deepcopy(task_cls.TASK_DEFAULTS)
+		# Only task and scene settings are forwarded to the environment.
 		for key in cfg.keys():
 			if str(key).startswith("traj_") or key in {"size", "action_repeat", "time_limit", "seed"}:
 				task._traj_cfg[key] = cfg[key]
@@ -60,13 +71,16 @@ class TorchTrajectoryShapeVectorEnv:
 
 	@property
 	def control_mode(self):
+		"""Return the shaping task control interface."""
 		return "default"
 
 	@property
 	def unwrapped(self):
+		"""Return the tensor adapter without an additional wrapper layer."""
 		return self
 
 	def reset(self, seed=None, options=None):
+		"""Reset all rows and counters, optionally reseeding task random streams."""
 		if seed is not None:
 			if isinstance(seed, (list, tuple, np.ndarray)):
 				seed = int(seed[0])
@@ -85,19 +99,27 @@ class TorchTrajectoryShapeVectorEnv:
 		return obs, task.get_info()
 
 	def step(self, action):
+		"""
+		Advance [B, 3] actions and return observations, rewards, and timeout flags.
+		Completed observations remain available for replay; the trainer resets
+		the batch after consuming final_observation and final_info.
+		"""
 		obs, reward, terminated, truncated, info = self._task.step(action)
 		self._episode_returns += reward
 		self._episode_lengths += 1
+		# Use truncation for fixed-horizon episodes; the coverage task has no terminal success.
 		timeout = self._task._elapsed_steps >= self.max_episode_steps
 		terminated = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 		truncated = timeout.clone()
 		info = dict(info)
+		# Preserve the final state before the trainer starts the next episode.
 		if timeout.any():
 			info["final_observation"] = obs.clone() if torch.is_tensor(obs) else copy.deepcopy(obs)
 			info["final_info"] = {"episode": self._episode_metrics(info)}
 		return obs, reward, terminated, truncated, info
 
 	def _episode_metrics(self, info):
+		"""Collect returns, lengths, and task diagnostics for the completed batch."""
 		episode = {
 			"return": self._episode_returns.clone(),
 			"episode_len": self._episode_lengths.float().clone(),
@@ -110,11 +132,14 @@ class TorchTrajectoryShapeVectorEnv:
 		return episode
 
 	def render(self):
+		"""Return the task diagnostic frames without a rendering backend."""
 		return self._task.render()
 
 	def close(self):
+		"""Close the tensor adapter; no simulator resources are held."""
 		return None
 
 
 def make_trajectory_shape_vector_env(cfg, num_envs: int, is_eval: bool = False):
+	"""Construct a tensor vector environment for training or evaluation."""
 	return TorchTrajectoryShapeVectorEnv(cfg, num_envs, is_eval=is_eval)

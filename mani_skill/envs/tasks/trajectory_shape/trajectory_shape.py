@@ -1,3 +1,4 @@
+"""Closed-path shaping dynamics, partial observations, and core reward."""
 import copy
 import math
 from collections import OrderedDict
@@ -8,6 +9,7 @@ import torch
 from gymnasium.vector.utils import batch_space
 
 def _parse_xy_points(value: Any, name: str) -> np.ndarray:
+    """Parse an optional x,y list into finite world-coordinate points [P, 2]."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return np.zeros((0, 2), dtype=np.float32)
     if isinstance(value, str):
@@ -22,6 +24,7 @@ def _parse_xy_points(value: Any, name: str) -> np.ndarray:
     return points
 
 def _as_pair(value):
+    """Normalize a grid size to an integer (height, width) pair."""
     if isinstance(value, str):
         parts = [int(x.strip()) for x in value.strip("()[]").split(",") if x.strip()]
         if len(parts) == 2:
@@ -30,6 +33,7 @@ def _as_pair(value):
         return int(value[0]), int(value[1])
     return int(value), int(value)
 
+# Task defaults are shared by direct construction and the tensor vector adapter.
 TRAJECTORY_SHAPE_POMDP_DEFAULTS = {'size': (64, 64),
  'action_repeat': 1,
  'time_limit': 256,
@@ -103,7 +107,12 @@ TRAJECTORY_SHAPE_POMDP_DEFAULTS = {'size': (64, 64),
  'traj_reward_t_theta_weight': 0.3}
 
 class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
-    """Final partial-observation orbit task with visible-only state statistics."""
+    """
+    Tensor-only closed-path shaping task with partial PoI observations.
+    The path is stored as log radius [B, A]; actions select deformation
+    location, signed amplitude, and width. Policy state uses visible PoIs
+    only, while scene PoIs remain available for reward and diagnostics.
+    """
     SUPPORTED_OBS_MODES = ("state", "state_dict", "none")
     SUPPORTED_REWARD_MODES = ("normalized_dense", "dense", "none")
     SUPPORTED_ROBOTS = ["none"]
@@ -112,6 +121,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"]}
 
     def __init__(self, num_envs=1, device="cpu", obs_mode="state", render_mode=None, **kwargs):
+        """Configure the tensor task, allocate spaces, and initialize a batch of episodes."""
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
         self._obs_mode = obs_mode
@@ -133,13 +143,19 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
 
     @property
     def obs_mode(self):
+        """Return the requested observation container format."""
         return self._obs_mode
 
     @property
     def control_mode(self):
+        """Return the fixed control interface for the shaping task."""
         return "default"
 
     def reset(self, *, seed=None, options=None):
+        """
+        Reset the selected seed and initialize all environments.
+        Returns the stacked policy state and a copy of the task diagnostics.
+        """
         if seed is not None:
             torch.manual_seed(int(seed))
             np.random.seed(int(seed) % (2**32 - 1))
@@ -150,9 +166,15 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return self._last_obs, self.get_info()
 
     def close(self):
+        """Release the environment interface; no simulator resources are owned."""
         return None
 
     def _configure_from_dict(self, cfg):
+        """
+        Resolve geometry, PoI dynamics, observation, and reward settings.
+        The policy layout keeps visible-only statistics and a fixed frame size.
+        """
+        # Path discretization and the physical coverage scale.
         self._height, self._width = _as_pair(cfg.get("size", (64, 64)))
         self._action_repeat = max(1, int(cfg.get("action_repeat", 1)))
         self._num_angles = int(cfg.get("traj_num_angles", 128))
@@ -169,6 +191,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._reward_abs_weight = float(cfg.get("traj_reward_abs_weight", 0.45))
         self._min_poi_coverage_radius = float(cfg.get("traj_min_poi_coverage_radius", 1.8))
         self._directional_target_sigma = float(cfg.get("traj_directional_target_sigma", 0.35))
+        # Map the normalized macro action into physical shaping parameters.
         self._phi_max = math.pi
         self._alpha_max = float(cfg.get("traj_alpha_max", 0.3))
         self._lambda_min = float(cfg.get("traj_lambda_min", 0.2))
@@ -179,6 +202,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._poi_num_max = max(self._poi_num_min, int(cfg.get("traj_poi_num_max", 8)))
         self._poi_max_obs = max(int(cfg.get("traj_poi_max_obs", self._poi_num_max)), self._poi_num_max, 1)
         self._r_soft = float(cfg.get("traj_r_soft", self._kernel_sigma_phys))
+        # PoI motion can use hotspot dynamics or prescribed endpoint trajectories.
         self._poi_dt = float(cfg.get("traj_poi_dt", 0.05))
         self._poi_dynamic_enabled = bool(cfg.get("traj_poi_dynamic_enabled", True))
         self._poi_motion_mode = str(cfg.get("traj_poi_motion_mode", "hotspot")).strip().lower()
@@ -217,6 +241,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._nofly_radius_min_ratio = float(max(0.0, cfg.get("traj_nofly_radius_min_ratio", 0.5)))
         self._nofly_radius_max_ratio = float(max(self._nofly_radius_min_ratio, cfg.get("traj_nofly_radius_max_ratio", 1.0)))
         self._nofly_penalty = float(max(0.0, cfg.get("traj_nofly_penalty", 3.0)))
+        # Keep the observation layout separate from scene-generation settings.
         self._source_compatible_rng = bool(cfg.get("traj_source_compatible_rng", True))
         self._obs_vector_mode = str(cfg.get("traj_obs_vector_mode", "compact")).lower()
         self._privileged_stats_in_obs = bool(cfg.get("traj_privileged_stats_in_obs", False))
@@ -237,21 +262,25 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._uav_init_noise_ratio = max(0.0, float(cfg.get("traj_uav_init_noise_ratio", 0.03)))
         self._hide_hotspots = bool(cfg.get("traj_hide_hotspots", False))
         self._curve_dim = self._num_angles if self._curve_repr == "raw" else 2 * self._fft_k + 1
+        # One compact frame: curve features, center, visible PoIs, and three statistics.
         self._single_state_dim = self._curve_dim + 2 + 2 * self._poi_max_obs + 3
         self._state_dim = self._single_state_dim * self._stack_len
         self._theta_cpu = torch.linspace(0.0, 2.0 * math.pi, self._num_angles + 1)[:-1]
         self._subsample_t_cpu = torch.arange(self._traj_subsamples, dtype=torch.float32) / float(self._traj_subsamples)
         self._reward_t_theta_weight = float(cfg.get("traj_reward_t_theta_weight", 0.30))
         self._kernel_cutoff = float(cfg.get("traj_kernel_cutoff", 2.0))
+        # Reject observation settings that would expose privileged scene statistics.
         if self._privileged_stats_in_obs or self._obs_mode_task != "partial":
             raise ValueError("This task requires partial observations and visible-only statistics.")
         if self._obs_vector_mode != "compact":
             raise ValueError("This task uses compact state observations.")
 
     def _action_dim(self):
+        """Return the three-dimensional local shaping action size."""
         return 3
 
     def _make_single_action_space(self):
+        """Build the normalized Box space for (phi, alpha, width)."""
         dim = int(self._action_dim())
         return gym.spaces.Box(
             low=-np.ones(dim, dtype=np.float32),
@@ -260,6 +289,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         )
 
     def _ensure_storage(self):
+        """
+        Allocate batch state on the configured device when its size changes.
+        Scene PoIs and noisy visible PoIs are kept in separate tensors.
+        """
         n = int(self.num_envs)
         d = self.device
         if hasattr(self, "_u") and self._u.shape[0] == n:
@@ -272,17 +305,20 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._center_offset = torch.zeros((n, 2), device=d)
         self._poi_num = torch.zeros((n,), dtype=torch.long, device=d)
         self._poi_mask = torch.zeros((n, self._poi_max_obs), dtype=torch.bool, device=d)
+        # Full scene state is used by dynamics, sensors, and reward.
         self._poi_pos = torch.zeros((n, self._poi_max_obs, 2), device=d)
         self._poi_hotspots = torch.zeros((n, self._poi_hotspot_num, 2), device=d)
         self._poi_target_hotspot = torch.zeros((n, self._poi_max_obs), dtype=torch.long, device=d)
         self._poi_v_rand = torch.zeros((n, self._poi_max_obs, 2), device=d)
         self._poi_retarget_timer = torch.zeros((n,), dtype=torch.long, device=d)
+        # Policy-visible buffers hold only sampled points after dropout and noise.
         self._poi_points_obs = torch.zeros((n, self._poi_max_obs, 2), device=d)
         self._poi_mask_obs = torch.zeros((n, self._poi_max_obs, 1), dtype=torch.float32, device=d)
         self._uav_phase = torch.zeros((n, self._uav_num), device=d)
         self._uav_pos = torch.zeros((n, self._uav_num, 2), device=d)
         self._uav_heading = torch.zeros((n, self._uav_num), device=d)
         self._uav_ever_covered = torch.zeros((n, self._poi_max_obs), dtype=torch.bool, device=d)
+        # Store frames explicitly so the policy receives a fixed-size history.
         self._state_history = torch.zeros((n, self._stack_len, self._single_state_dim), device=d)
         self._stacked_state = torch.zeros((n, self._state_dim), device=d)
         self._prev_mean_poi_dist = torch.zeros((n,), device=d)
@@ -291,6 +327,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._ensure_source_rng_state()
 
     def _ensure_source_rng_state(self):
+        """Maintain one NumPy random stream and observation-ID history per environment."""
         n = int(getattr(self, "num_envs", 1))
         seed = int(getattr(self, "_source_seed", self._traj_cfg.get("seed", 0) if hasattr(self, "_traj_cfg") else 0))
         if not hasattr(self, "_source_np_rngs") or len(self._source_np_rngs) != n:
@@ -301,6 +338,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             self._ever_observed_poi_ids = [set() for _ in range(n)]
 
     def _set_source_seed(self, seed: int):
+        """Reset per-environment random streams and PoI discovery bookkeeping."""
         seed = int(seed)
         self._source_seed = seed
         n = int(getattr(self, "num_envs", 1))
@@ -309,9 +347,11 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._ever_observed_poi_ids = [set() for _ in range(n)]
 
     def _source_env_ids(self, env_idx: torch.Tensor):
+        """Convert a tensor of environment indexes into host-side integer IDs."""
         return [int(x) for x in env_idx.detach().cpu().numpy().reshape(-1).tolist()]
 
     def _project_point_to_feasible_np(self, point: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
+        """Reflect a point at the domain boundary and project it outside no-fly disks."""
         p = np.asarray(point, dtype=np.float32).reshape(2).copy()
         R = float(self._domain_radius)
         for dim in range(2):
@@ -336,6 +376,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return np.clip(p, -R, R).astype(np.float32)
 
     def _inside_any_nofly_np(self, points: np.ndarray) -> np.ndarray:
+        """Return a boolean mask for points contained in configured no-fly disks."""
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
         centers = getattr(self, "_nofly_centers_np", None)
         radii = getattr(self, "_nofly_radii_np", None)
@@ -346,6 +387,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return np.any(dist_sq <= (radii[None, :] ** 2), axis=1)
 
     def _sample_hotspots_np(self, rng: np.random.RandomState, num_hotspots: int) -> np.ndarray:
+        """Sample separated feasible hotspot centers with the supplied random stream."""
         R = float(self._domain_radius)
         num_hotspots = int(max(1, num_hotspots))
         d_min = float(max(self._poi_hotspot_min_dist, 0.5 * self._r_soft))
@@ -383,6 +425,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         poi_num: int,
         force_change: bool = True,
     ) -> np.ndarray:
+        """
+        Assign PoIs to hotspots while balancing occupancy and target diversity.
+        Prefer a different hotspot from the previous target when requested.
+        """
         K = int(self._poi_hotspot_num)
         N = int(poi_num)
         targets = np.asarray(current_targets, dtype=np.int64).reshape(-1)[: max(N, 0)].copy()
@@ -424,6 +470,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return new_targets.astype(np.int64)
 
     def _apply_scripted_poi_initial_positions(self, env_idx: torch.Tensor) -> None:
+        """Replace sampled PoI positions with the configured scripted start points."""
         if self._poi_motion_mode != "scripted_endpoints":
             return
         count = int(self._poi_script_start_xy.shape[0])
@@ -437,6 +484,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._poi_v_rand[env_idx] = 0.0
 
     def _advance_scripted_poi_dynamics(self) -> None:
+        """Interpolate scripted PoIs from start to end using the elapsed macro step."""
         progress = (self._elapsed_steps.float() / float(self._poi_script_duration_steps)).clamp(0.0, 1.0)
         if self._poi_script_easing == "smoothstep":
             progress = progress * progress * (3.0 - 2.0 * progress)
@@ -446,6 +494,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._poi_pos[:, : start.shape[0]] = pos
 
     def _initialize_episode_source_compatible(self, env_idx: torch.Tensor, options: dict):
+        """
+        Initialize scene state with independent, source-compatible NumPy streams.
+        Repeat the initial visible state across the observation-history slots.
+        """
         self._ensure_source_rng_state()
         ids = self._source_env_ids(env_idx)
         base_radius = float(np.clip(self._kernel_sigma_phys, self._radius_min, self._radius_max))
@@ -498,8 +550,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._apply_scripted_poi_initial_positions(env_idx)
         self._reset_uav_observers(env_idx)
         self._uav_ever_covered[env_idx] = False
+        # Initialize visibility from the path; joint evaluation replaces it from UAV positions.
         self._sample_poi_observation_source(env_idx, force=True, use_trajectory_observer=True)
         single = self._single_state(env_idx)
+        # Fill the reset history with copies of the initial frame.
         self._state_history[env_idx] = single.unsqueeze(1).expand(-1, self._stack_len, -1)
         self._refresh_stacked_state(env_idx)
         rho_bar, w_dir = self._directional_target(env_idx)
@@ -511,6 +565,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._update_metrics(env_idx, mean_dist=mean_dist, reward=torch.zeros_like(mean_dist), rho_bar=rho_bar)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        """Initialize indexed environments using the selected random-number backend."""
         self._ensure_storage()
         env_idx = env_idx.to(self.device)
         if self._source_compatible_rng:
@@ -554,6 +609,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._update_metrics(env_idx, mean_dist=mean_dist, reward=torch.zeros_like(mean_dist), rho_bar=rho_bar)
 
     def _sample_hotspots(self, env_idx):
+        """Sample batched hotspot centers using the Torch random stream."""
         b = len(env_idx)
         rmin = self._poi_hotspot_radius_min_ratio * self._domain_radius
         rmax = self._poi_hotspot_radius_max_ratio * self._domain_radius
@@ -564,12 +620,14 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._poi_hotspots[env_idx] = pts.clamp(-self._domain_radius, self._domain_radius)
 
     def _retarget_pois(self, env_idx):
+        """Assign batched PoI targets to a randomly shifted hotspot index sequence."""
         b = len(env_idx)
         base = torch.arange(self._poi_max_obs, device=self.device).view(1, -1)
         offset = torch.randint(0, self._poi_hotspot_num, (b, 1), device=self.device)
         self._poi_target_hotspot[env_idx] = (base + offset) % self._poi_hotspot_num
 
     def get_obs(self, info=None, unflattened: bool = False):
+        """Return the stacked policy state, optionally wrapped in a state dictionary."""
         self._ensure_storage()
         if self.obs_mode == "none":
             return {}
@@ -578,6 +636,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return self._stacked_state
 
     def get_info(self):
+        """Return detached copies of elapsed steps and task-level diagnostics."""
         self._ensure_storage()
         info = dict(elapsed_steps=self._elapsed_steps.clone())
         for key, value in self._latest_metrics.items():
@@ -585,12 +644,19 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return info
 
     def get_state_dict(self):
+        """Expose the legacy empty state-dictionary interface for this tensor task."""
         return OrderedDict()
 
     def set_state_dict(self, state: dict, env_idx: torch.Tensor = None):
+        """Keep the legacy no-op state-loading interface."""
         return None
 
     def step(self, action):
+        """
+        Apply shaping actions [B, 3] and advance the native tensor rollout.
+        Update reward, observer state, and partial observations before shifting
+        the frame history. The vector adapter handles episode time limits.
+        """
         self._ensure_storage()
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device)
         if action.ndim == 1:
@@ -598,6 +664,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         if action.shape[0] != self.num_envs:
             action = action.expand(self.num_envs, -1)
         reward_total = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        # Native transition order: shaping/PoI motion, reward, observers, then sensing.
         for _ in range(self._action_repeat):
             self._elapsed_steps += 1
             self._advance_dynamics(action)
@@ -606,6 +673,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             self._sample_poi_observation(torch.arange(self.num_envs, device=self.device), force=False)
         self._latest_reward = reward_total
         single = self._single_state(torch.arange(self.num_envs, device=self.device))
+        # Append the newest partial observation after the transition.
         self._state_history = torch.roll(self._state_history, shifts=-1, dims=1)
         self._state_history[:, -1] = single
         self._refresh_stacked_state(torch.arange(self.num_envs, device=self.device))
@@ -617,6 +685,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return obs, reward_total, terminated, truncated, info
 
     def _advance_poi_dynamics_source_compatible(self):
+        """Advance hotspot-driven PoIs with inertia and per-environment random streams."""
         self._ensure_source_rng_state()
         env_ids = range(int(self.num_envs))
         if self._poi_retarget_interval > 0:
@@ -656,20 +725,29 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             self._poi_v_rand[env_i, :poi_num_i] = torch.as_tensor(v_np, dtype=torch.float32, device=self.device)
 
     def _advance_dynamics(self, action):
+        """Update the patrol path first, then advance the PoI scene."""
         self._advance_orbit_action(action)
         self._advance_poi_dynamics()
 
     def _advance_orbit_action(self, action):
+        """
+        Apply a wrapped Gaussian deformation to the batched log-radius path.
+        Signed amplitude allows expansion or contraction; clipping enforces
+        the radius bounds after the multiplicative update.
+        """
         phi = action[:, 0] * self._phi_max
         alpha = action[:, 1] * self._alpha_max
         lam = self._lambda_min + 0.5 * (action[:, 2] + 1.0) * (self._lambda_max - self._lambda_min)
+        # Use the shortest angular displacement so the deformation wraps at the seam.
         delta = (self._theta.view(1, -1) - phi.view(-1, 1) + math.pi) % (2.0 * math.pi) - math.pi
         weight = torch.exp(-0.5 * (delta / lam.clamp_min(1e-3).view(-1, 1)) ** 2)
+        # A multiplicative radius change becomes additive in log-radius space.
         inc = torch.log((1.0 + alpha.view(-1, 1) * weight).clamp_min(1e-6))
         radius = torch.exp(self._u + inc).clamp(self._radius_min, self._radius_max)
         self._u = torch.log(radius)
 
     def _advance_poi_dynamics(self):
+        """Advance scripted or hotspot-driven PoIs using the configured backend."""
         if not self._poi_dynamic_enabled:
             return
         if self._poi_motion_mode == "scripted_endpoints":
@@ -700,6 +778,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._poi_pos = torch.where(self._poi_mask.unsqueeze(-1), pos, torch.zeros_like(pos))
 
     def _trajectory_points(self, env_idx):
+        """
+        Interpolate the closed radial path into world-coordinate points.
+        Returns [B, num_angles * subsamples, 2] for the indexed environments.
+        """
         radius = torch.exp(self._u[env_idx])
         base = torch.stack(
             [
@@ -709,16 +791,19 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             dim=-1,
         )
         base = base + self._center_offset[env_idx].view(-1, 1, 2)
+        # Include the closing segment from the last angular sample to the first.
         nxt = torch.roll(base, shifts=-1, dims=1)
         t = self._subsample_t.view(1, 1, -1, 1)
         pts = (1.0 - t) * base.unsqueeze(2) + t * nxt.unsqueeze(2)
         return pts.reshape(len(env_idx), self._num_angles * self._traj_subsamples, 2)
 
     def _poi_traj_distance(self, env_idx, traj):
+        """Compute scene-PoI to path-point distances [B, P, K]."""
         pts = self._poi_pos[env_idx]
         return torch.linalg.norm(pts.unsqueeze(2) - traj.unsqueeze(1), dim=-1)
 
     def _reset_uav_observers(self, env_idx):
+        """Place native UAV observers at separated phases with optional position noise."""
         if self._obs_source != "uav":
             return
         b = len(env_idx)
@@ -741,6 +826,10 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._uav_heading[env_idx] = (phase + 0.5 * math.pi) % (2.0 * math.pi)
 
     def _advance_uav_observers(self, env_idx):
+        """
+        Advance lightweight native observers toward phase-indexed path targets.
+        Joint evaluation instead refreshes visibility from the external LOS state.
+        """
         if self._obs_source != "uav" or env_idx.numel() == 0:
             return
         phase = (self._uav_phase[env_idx] + self._uav_phase_speed) % (2.0 * math.pi)
@@ -773,6 +862,11 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         reset_observation_bookkeeping=False,
         use_trajectory_observer=False,
     ):
+        """
+        Sample visible PoIs with per-environment random streams.
+        Explicit observer points override native UAV or trajectory visibility.
+        Only retained noisy points are written into the policy observation slots.
+        """
         if env_idx.numel() == 0:
             return
         self._ensure_source_rng_state()
@@ -807,6 +901,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             if self._obs_mode_task == "full":
                 idx = np.arange(pts_true.shape[0], dtype=np.int64)
             else:
+                # Explicit observer positions take precedence over native visibility sources.
                 if observer_np is not None:
                     dist = np.sqrt(np.sum((pts_true[:, None, :] - observer_np[None, :, :]) ** 2, axis=-1)).astype(np.float32)
                 elif self._obs_source == "uav" and not use_trajectory_observer:
@@ -818,6 +913,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
                     dist = np.sqrt(np.sum((pts_true[:, None, :] - traj[None, :, :]) ** 2, axis=-1)).astype(np.float32)
                 dists = np.min(dist, axis=1).astype(np.float32) if dist.ndim == 2 and dist.shape[1] > 0 else np.full((pts_true.shape[0],), np.inf, dtype=np.float32)
                 idx = np.where(dists < float(self._r_soft))[0].astype(np.int64)
+            # Shuffle visible points before applying dropout and capacity truncation.
             if idx.size > 1:
                 idx = rng.permutation(idx)
             if idx.size > 0 and self._obs_dropout_prob > 0.0:
@@ -834,6 +930,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
                     mean_obs_noise = float(np.mean(np.linalg.norm(obs_pts - obs_pts_true, axis=1)))
                 self._poi_points_obs[env_i, :n] = torch.as_tensor(obs_pts, dtype=torch.float32, device=self.device)
                 self._poi_mask_obs[env_i, :n, 0] = 1.0
+            # Discovery IDs are diagnostics; the policy receives coordinates and visible statistics.
             current_ids = set(int(x) for x in selected_idx.tolist())
             newly = len(current_ids.difference(self._prev_observed_poi_ids[env_i]))
             self._prev_observed_poi_ids[env_i] = current_ids
@@ -846,6 +943,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             self._set_metric(idx_tensor, "mean_obs_noise", torch.tensor([float(mean_obs_noise)], device=self.device))
 
     def _sample_poi_observation(self, env_idx, force=False, observer_points=None, reset_observation_bookkeeping=False):
+        """Refresh visibility, dropout, and noise with the selected observation backend."""
         if self._source_compatible_rng:
             self._sample_poi_observation_source(
                 env_idx,
@@ -896,6 +994,11 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         self._set_metric(env_idx, "mean_obs_noise", torch.full((b,), self._obs_noise_std, device=self.device))
 
     def _single_state(self, env_idx):
+        """
+        Encode one compact policy frame [B, D_frame].
+        Concatenate path features, center, padded visible points, and visible-only
+        count/distance/coverage statistics; scene PoIs do not enter this tail.
+        """
         radius = torch.exp(self._u[env_idx])
         if self._curve_repr == "raw":
             curve = ((radius - self._radius_min) / max(self._radius_max - self._radius_min, 1e-6)).clamp(0.0, 1.0)
@@ -903,6 +1006,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             mid = 0.5 * (self._radius_max + self._radius_min)
             half = max(0.5 * (self._radius_max - self._radius_min), 1e-6)
             r_norm = ((radius - mid) / half).clamp(-1.0, 1.0)
+            # Encode the radius with DC and interleaved low-frequency real/imaginary coefficients.
             spectrum = torch.fft.rfft(r_norm, dim=-1) / float(self._num_angles)
             parts = [spectrum[:, :1].real]
             coeffs = spectrum[:, 1 : self._fft_k + 1]
@@ -914,6 +1018,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         poi = (self._poi_points_obs[env_idx] / self._domain_radius).clamp(-1.0, 1.0).reshape(len(env_idx), -1)
         count_ratio = self._poi_mask_obs[env_idx, :, 0].mean(dim=1, keepdim=True)
 
+        # Build the observation tail from the same visible-point buffers.
         mean_dist, min_cov = self._observed_poi_traj_stats(env_idx)
         mean_dist = (mean_dist / self._domain_radius).clamp(0.0, 4.0).unsqueeze(-1)
         min_cov = min_cov.clamp(0.0, 1.0).unsqueeze(-1)
@@ -921,9 +1026,11 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return torch.cat([curve, center, poi, count_ratio, mean_dist, min_cov], dim=-1).float()
 
     def _refresh_stacked_state(self, env_idx):
+        """Flatten indexed frame histories into [B, stack_len * D_frame]."""
         self._stacked_state[env_idx] = self._state_history[env_idx].reshape(len(env_idx), -1)
 
     def _directional_target(self, env_idx):
+        """Compute a scene-PoI radial target and angular weights for diagnostics."""
         radius = torch.exp(self._u[env_idx])
         r_mean = radius.mean(dim=1, keepdim=True)
         rel = self._poi_pos[env_idx] - self._center_offset[env_idx].unsqueeze(1)
@@ -939,13 +1046,20 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
 
 
     def _compute_reward(self):
+        """
+        Compute the distance and planned-coverage core reward for each environment.
+        Scene PoIs provide the reward target; this calculation does not augment
+        the visible-only state returned to the policy.
+        """
         env_idx = torch.arange(self.num_envs, device=self.device)
         traj = self._trajectory_points(env_idx)
         dist = self._poi_traj_distance(env_idx, traj)
         min_dist = dist.min(dim=-1).values
         mean_dist = self._masked_mean(min_dist, self._poi_mask, dim=1)
+        # Penalize mean scene-PoI distance to the shaped patrol path.
         reward_abs = -self._reward_abs_weight * mean_dist
 
+        # Add the planned-coverage deficit term to the core reward.
         t_theta = self._compute_t_theta_from_dist(dist, self._poi_mask)
         t_theta_error = 1.0 - t_theta
         reward_t_theta = -self._reward_t_theta_weight * t_theta_error
@@ -971,6 +1085,7 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return reward.float()
 
     def _update_metrics(self, env_idx, **kwargs):
+        """Store per-environment reward components and geometric diagnostics."""
         n = self.num_envs
         for key, value in kwargs.items():
             if key == "rho_bar":
@@ -1008,33 +1123,43 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
             self._latest_metrics["min_poi_coverage"][env_idx] = kwargs.get("min_cov_ratio", torch.zeros_like(kwargs["reward"])).detach()
 
     def _set_metric(self, env_idx, key, value):
+        """Allocate a metric slot when needed and update its indexed values."""
         if key not in self._latest_metrics:
             self._latest_metrics[key] = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self._latest_metrics[key][env_idx] = value.detach().float()
 
     @staticmethod
     def _masked_mean(values, mask, dim):
+        """Compute a mean over valid entries, with a safe denominator for empty masks."""
         values = values * mask.float()
         return values.sum(dim=dim) / mask.float().sum(dim=dim).clamp_min(1.0)
 
     @staticmethod
     def _masked_min(values, mask, dim):
+        """Compute a masked minimum and return zero when no entry is valid."""
         inf = torch.full_like(values, float("inf"))
         out = torch.where(mask, values, inf).min(dim=dim).values
         return torch.where(torch.isfinite(out), out, torch.zeros_like(out))
 
     @staticmethod
     def _masked_mean_points(points, mask):
+        """Compute the masked point centroid with an empty-mask safeguard."""
         weights = mask.float().unsqueeze(-1)
         return (points * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        """Return the latest reward computed by the tensor transition."""
         return self._latest_reward
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        """Expose the same core reward through the normalized-reward interface."""
         return self.compute_dense_reward(obs, action, info)
 
     def render(self):
+        """
+        Render observed PoIs, the path, and scene PoIs as diagnostic uint8 frames.
+        Returns [B, height, width, 3]; these frames are not policy inputs.
+        """
         self._ensure_storage()
         env_idx = torch.arange(self.num_envs, device=self.device)
         traj = self._trajectory_points(env_idx)
@@ -1048,12 +1173,17 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return (frames.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
 
     def _scatter_points(self, canvas, points, mask):
+        """Rasterize masked world-coordinate points into a batched image channel."""
         x = ((points[..., 0] + self._domain_radius) / (2.0 * self._domain_radius) * (self._width - 1)).round().long().clamp(0, self._width - 1)
         y = ((points[..., 1] + self._domain_radius) / (2.0 * self._domain_radius) * (self._height - 1)).round().long().clamp(0, self._height - 1)
         env = torch.arange(points.shape[0], device=self.device).view(-1, 1).expand_as(x)
         canvas[env[mask], y[mask], x[mask]] = 1.0
 
     def _observed_poi_traj_stats(self, env_idx):
+        """
+        Compute distance and soft-coverage statistics from visible PoIs only.
+        Empty observations produce zero statistics rather than scene-level values.
+        """
         b = len(env_idx)
         visible = self._poi_mask_obs[env_idx, :, 0] > 0.5
         if b == 0:
@@ -1077,11 +1207,17 @@ class TrajectoryShapePOMDPV2CoreRewardEnv(gym.Env):
         return mean_dist, min_cov
 
     def _compute_t_theta_from_dist(self, dist, mask):
+        """
+        Approximate planned coverage from truncated Gaussian path footprints.
+        Average each PoI footprint, apply the resource/decay scale and saturation,
+        then reduce over valid scene PoIs.
+        """
         sigma = max(float(self._kernel_sigma_phys), 1e-6)
         heat = torch.exp(-0.5 * (dist / sigma).square())
         cutoff = max(float(self._kernel_cutoff), 0.0) * sigma
         if cutoff > 0.0:
             heat = torch.where(dist <= cutoff, heat, torch.zeros_like(heat))
+        # Approximate the steady-state footprint before applying heat saturation.
         poi_heat = heat.mean(dim=-1)
         scale = float(self._resource_eta) * float(self._num_agents) / max(float(self._heat_lambda), 1e-6)
         poi_heat_sat = (scale * poi_heat / max(float(self._phi_sat), 1e-6)).clamp(0.0, 1.0)

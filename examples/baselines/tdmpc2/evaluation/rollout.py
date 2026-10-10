@@ -6,7 +6,12 @@ import numpy as np
 import torch
 
 def _joint_refresh_observation(task: Any, tracking_state: Any, *, reset: bool) -> Any:
+    """
+    Refresh visibility from the executed UAV positions and update frame history.
+    Reset duplicates the current frame; subsequent calls append one new frame.
+    """
     env_idx = torch.arange(int(task.num_envs), device=task.device)
+    # Force sensing from executed positions after each joint evaluation step.
     task._sample_poi_observation(
         env_idx,
         force=True,
@@ -14,6 +19,7 @@ def _joint_refresh_observation(task: Any, tracking_state: Any, *, reset: bool) -
         reset_observation_bookkeeping=bool(reset),
     )
     single = task._single_state(env_idx)
+    # Reset has no earlier frames, so repeat the first partial observation.
     if reset:
         task._state_history[env_idx] = single.unsqueeze(1).expand(-1, int(task._stack_len), -1)
     else:
@@ -25,6 +31,10 @@ def _joint_refresh_observation(task: Any, tracking_state: Any, *, reset: bool) -
     return obs
 
 def _joint_apply_action(task: Any, action: Any) -> torch.Tensor:
+    """
+    Apply the shaping action and PoI motion before the external UAV step.
+    Return the core reward without advancing native observers or frame history.
+    """
     action_t = torch.as_tensor(action, dtype=torch.float32, device=task.device)
     if action_t.shape == (3,):
         action_t = action_t.unsqueeze(0)
@@ -44,6 +54,10 @@ def _initial_uav_state(
     rng: np.random.RandomState,
     initial_position_items: Sequence[str] | None = None,
 ):
+    """
+    Initialize phase-separated UAV positions and tangential headings.
+    Optional explicit positions must match the team size and world bounds.
+    """
     num = max(int(getattr(task, "_uav_num", 4)), 1)
     domain_radius = float(getattr(task, "_domain_radius", 1.0))
     items = [str(item).strip() for item in (initial_position_items or []) if str(item).strip()]
@@ -75,7 +89,12 @@ def _initial_uav_state(
     return tracking.UnicycleSwarmState(positions=positions, headings=headings)
 
 def _step_uav_tracking(tracking: Any, task: Any, state: Any, curve: np.ndarray):
+    """
+    Execute one fixed-profile LOS/phase tracking step on the shaped path.
+    Returns the next unicycle state, controls [N, 2], and mean projection error.
+    """
     profile = SimpleNamespace(dt=0.1)
+    # Resample the radial path into the executor's fixed-resolution closed polyline.
     polyline, _ = tracking.curve_to_polyline(np.asarray(curve, dtype=np.float64), num_points=256, smoothing_window=5)
     ref = tracking.ReferenceTrajectory(polyline)
     v_min, v_max = 0.0, 1.8
@@ -96,6 +115,7 @@ def _step_uav_tracking(tracking: Any, task: Any, state: Any, curve: np.ndarray):
     )
     v_cmd, w_cmd, dbg = controller.step(state, return_debug=True)
     dt = float(profile.dt)
+    # Integrate heading first, then translate using the updated heading.
     headings = np.asarray([tracking.wrap_angle(float(psi + dt * omega)) for psi, omega in zip(state.headings, w_cmd)], dtype=np.float64)
     direction = np.stack([np.cos(headings), np.sin(headings)], axis=-1).astype(np.float64)
     positions = state.positions + direction * np.asarray(v_cmd, dtype=np.float64).reshape(-1, 1) * dt

@@ -9,14 +9,20 @@ UAV_ENERGY_LAMBDA_V = 1.0
 UAV_ENERGY_LAMBDA_A = 1.0
 
 def _curve_np(task: Any) -> np.ndarray:
+    """Export the first environment path as world-coordinate points [K, 2]."""
     env_idx = torch.arange(1, device=task.device)
     return task._trajectory_points(env_idx)[0].detach().cpu().numpy().astype(np.float32)
 
 def _poi_np(task: Any) -> np.ndarray:
+    """Export valid scene PoIs [P, 2] for evaluation reporting."""
     poi_num = int(task._poi_num[0].detach().cpu().item()) if torch.is_tensor(task._poi_num) else int(task._poi_num)
     return task._poi_pos[0, :poi_num].detach().cpu().numpy().astype(np.float32)
 
 def _grid_cache(task: Any) -> Dict[str, Any]:
+    """
+    Cache grid coordinates and the truncated Gaussian footprint kernel.
+    The cache key includes geometry, kernel parameters, and tensor device.
+    """
     height = int(getattr(task, "_height", 64))
     width = int(getattr(task, "_width", 64))
     domain_radius = float(getattr(task, "_domain_radius", 10.0))
@@ -28,6 +34,7 @@ def _grid_cache(task: Any) -> Dict[str, Any]:
     if isinstance(cache, dict) and cache.get("key") == key:
         return cache
 
+    # Use the same world bounds for interest maps and executed footprints.
     xs = np.linspace(-domain_radius, domain_radius, width, dtype=np.float32)
     ys = np.linspace(-domain_radius, domain_radius, height, dtype=np.float32)
     grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
@@ -57,6 +64,7 @@ def _grid_cache(task: Any) -> Dict[str, Any]:
     return cache
 
 def _points_to_grid_indices(task: Any, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Map world-coordinate points to clipped integer grid indexes."""
     cache = _grid_cache(task)
     pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     if pts.shape[0] == 0:
@@ -69,6 +77,10 @@ def _points_to_grid_indices(task: Any, points: np.ndarray) -> tuple[np.ndarray, 
     return ix, iy
 
 def _points_to_interest_map(task: Any, points: np.ndarray) -> np.ndarray:
+    """
+    Build a truncated Gaussian interest map from evaluation PoIs.
+    This scene-level map is used for scoring and never for planner input.
+    """
     cache = _grid_cache(task)
     height = int(cache["height"])
     width = int(cache["width"])
@@ -88,6 +100,7 @@ def _points_to_interest_map(task: Any, points: np.ndarray) -> np.ndarray:
     return np.clip(np.mean(contrib, axis=0), 0.0, 1.0).astype(np.float32)
 
 def _compute_points_coverage(task: Any, points: np.ndarray) -> np.ndarray:
+    """Rasterize sensing points and convolve their normalized occupancy footprint."""
     cache = _grid_cache(task)
     height = int(cache["height"])
     width = int(cache["width"])
@@ -103,6 +116,7 @@ def _compute_points_coverage(task: Any, points: np.ndarray) -> np.ndarray:
     iy = torch.as_tensor(iy_np, device=device, dtype=torch.long)
     flat = occ.view(-1)
     indices = (iy * int(width) + ix).long()
+    # Accumulate coincident sensing points before spatial convolution.
     flat.index_add_(0, indices, torch.ones_like(indices, dtype=flat.dtype))
     occ = flat.view_as(occ)
     conv = torch.nn.functional.conv2d(occ, cache["kernel"], padding=int(cache["kernel_radius_pix"]))
@@ -110,14 +124,18 @@ def _compute_points_coverage(task: Any, points: np.ndarray) -> np.ndarray:
     return conv[0, 0].detach().cpu().numpy().astype(np.float32)
 
 def _saturate_heat(task: Any, heat: np.ndarray) -> np.ndarray:
+    """Normalize and clip heat to [0, 1] when a positive saturation level is set."""
     phi_sat = float(getattr(task, "_phi_sat", 1.0))
+    # Saturation is applied when scoring, not when storing the accumulated heat.
     heat_arr = np.asarray(heat, dtype=np.float32)
     if phi_sat <= 0.0:
         return heat_arr.astype(np.float32)
     return np.clip(heat_arr / phi_sat, 0.0, 1.0).astype(np.float32)
 
 def _advance_uav_heat(task: Any, heat: np.ndarray, positions: np.ndarray, dt: float) -> np.ndarray:
+    """Decay the UAV heat field and accumulate the current sensing footprint."""
     lam = float(max(getattr(task, "_heat_lambda", 1.0), 0.0))
+    # Keep continuous-time decay consistent with the execution interval.
     decay = float(np.exp(-lam * float(dt)))
     footprint = _compute_points_coverage(task, positions)
     num_agents = float(max(getattr(task, "_num_agents", footprint.shape[0] if footprint.ndim > 0 else 1.0), 1e-6))
@@ -125,6 +143,7 @@ def _advance_uav_heat(task: Any, heat: np.ndarray, positions: np.ndarray, dt: fl
     return (decay * np.asarray(heat, dtype=np.float32) + resource * num_agents * footprint * float(dt)).astype(np.float32)
 
 def _weighted_overlap(coverage_sat: np.ndarray, weight_map: np.ndarray, eps: float) -> float:
+    """Compute normalized overlap between saturated heat and the interest map."""
     h_val = np.asarray(coverage_sat, dtype=np.float64)
     w_val = np.asarray(weight_map, dtype=np.float64)
     if h_val.size == 0 or w_val.size == 0 or h_val.shape != w_val.shape:
@@ -135,6 +154,10 @@ def _weighted_overlap(coverage_sat: np.ndarray, weight_map: np.ndarray, eps: flo
     return float(np.sum(h_val * w_val, dtype=np.float64) / (den + float(max(eps, 1e-12))))
 
 def _uav_grid_t_theta_and_point_metrics(task: Any, positions: np.ndarray, uav_coverage_sat: np.ndarray) -> Dict[str, float]:
+    """
+    Report executed grid coverage and instantaneous UAV-to-PoI geometry.
+    Ground-truth scene PoIs are used only for these evaluation metrics.
+    """
     pos = torch.as_tensor(np.asarray(positions, dtype=np.float32).reshape(1, -1, 2), device=task.device)
     env_idx = torch.arange(1, device=task.device)
     poi = task._poi_pos[env_idx]
@@ -154,6 +177,11 @@ def _uav_grid_t_theta_and_point_metrics(task: Any, positions: np.ndarray, uav_co
     }
 
 def _uav_execution_metrics(task: Any, positions: np.ndarray, action: np.ndarray | None, sweep_state: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Update PoI sweep counts, path length, and normalized control effort.
+    The supplied sweep_state retains cumulative episode statistics; effort
+    is a unicycle surrogate rather than a battery-energy estimate.
+    """
     dt = float(getattr(task, "_uav_dt", 0.1))
     dt = max(dt, 1e-9)
     sweep_state["step_count"] = int(sweep_state.get("step_count", 0)) + 1
@@ -166,6 +194,7 @@ def _uav_execution_metrics(task: Any, positions: np.ndarray, action: np.ndarray 
         dist = np.linalg.norm(poi[:, None, :] - pos[None, :, :], axis=-1)
         radius = float(getattr(task, "_min_poi_coverage_radius", getattr(task, "_r_soft", 1.8)))
         covered_ids = set(int(i) for i in np.where(np.min(dist, axis=1) < radius)[0])
+    # Track distinct PoI IDs over the episode, separately from per-step sweeps.
     seen: set[int] = sweep_state.setdefault("covered_poi_ids", set())
     new_ids = covered_ids - seen
     seen.update(covered_ids)
@@ -184,6 +213,7 @@ def _uav_execution_metrics(task: Any, positions: np.ndarray, action: np.ndarray 
         v_max = max(float(getattr(task, "_uav_speed", UAV_TRACKING_V_MAX)), 1e-9)
         omega_max = max(float(getattr(task, "_uav_omega_max", UAV_TRACKING_OMEGA_MAX)), 1e-9)
         a_max = max(v_max * omega_max, 1e-9)
+        # Normalize speed and lateral-acceleration proxies by fixed control scales.
         v_term = (speed / v_max) ** 2
         a_term = ((speed * omega) / a_max) ** 2
         energy_step = float(dt * np.sum(UAV_ENERGY_LAMBDA_V * v_term + UAV_ENERGY_LAMBDA_A * a_term, dtype=np.float64))

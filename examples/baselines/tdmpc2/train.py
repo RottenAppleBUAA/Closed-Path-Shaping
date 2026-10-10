@@ -25,17 +25,21 @@ def train(cfg):
         raise RuntimeError("GPU training requested but CUDA is unavailable.")
     if cfg.steps <= 0:
         raise ValueError("steps must be positive")
+    # Resolve model-size presets and seed the training random streams.
     cfg = parse_cfg(cfg)
     set_seed(cfg.seed)
     logger = Logger(cfg)
+    # Build independent training and evaluation batches before constructing the model.
     env = make_envs(cfg, cfg.num_envs)
     eval_env = make_envs(cfg, cfg.num_eval_envs, is_eval=True)
     print_run(cfg)
     agent = TDMPC2(cfg)
     if logger._wandb is not None:
         logger._wandb.config.update(OmegaConf.to_container(cfg, resolve=True), allow_val_change=True)
+    # Collect complete vector episodes and train the standard TD-MPC2 world model.
     trainer = OnlineTrainer(cfg=cfg, env=env, eval_env=eval_env, agent=agent,
                             buffer=Buffer(cfg), logger=logger)
+    # Save the effective architecture and planning budget next to the checkpoints.
     OmegaConf.save(cfg, cfg.work_dir / "config.yaml", resolve=True)
     trainer.train()
     env.close()
